@@ -123,6 +123,73 @@ app.post('/api/chat', auth, async (req, res) => {
   return res.status(400).json({ error: `Provider inconnu: ${provider}` });
 });
 
+// ─── /api/plan — génération de plan structuré par l'IA ──────────────────────
+// Retourne { plan: { summary, tasks[], milestones[] } }
+app.post('/api/plan', auth, async (req, res) => {
+  const ip = (req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? '').split(',')[0].trim();
+  if (!rateLimit(ip)) return res.status(429).json({ error: 'Trop de requêtes.' });
+  if (!GROQ_API_KEY)  return res.status(500).json({ error: 'GROQ_API_KEY non configurée.' });
+
+  const { projectName, projectDescription, category, deadline, existingTasks = [] } = req.body;
+  const today = new Date().toISOString().split('T')[0];
+
+  const systemPrompt = `Tu es un chef de projet expert. Génère un plan d'action COMPLET en JSON valide avec EXACTEMENT cette structure (rien d'autre) :
+{
+  "summary": "Présentation du plan en 3-4 phrases, comment atteindre l'objectif",
+  "tasks": [
+    { "title": "...", "priority": "high|medium|low", "dueDate": "YYYY-MM-DD ou null", "estimatedMinutes": 30, "notes": "..." }
+  ],
+  "milestones": [
+    { "title": "...", "date": "YYYY-MM-DD", "notes": "..." }
+  ]
+}
+Règles :
+- 8 à 15 tâches concrètes, actionnables, spécifiques au projet
+- 3 à 5 jalons clés représentant des étapes importantes
+- Dates réalistes à partir d'aujourd'hui (${today})${deadline ? `, deadline finale : ${deadline}` : ''}
+- Priorités cohérentes (les premières tâches souvent "high")
+- Réponds UNIQUEMENT avec le JSON, pas de texte autour`;
+
+  const userMsg = `Projet : "${projectName}"
+Catégorie : ${category}
+Description : ${projectDescription || 'Aucune description fournie'}
+Tâches déjà existantes : ${existingTasks.length > 0 ? existingTasks.join(', ') : 'aucune'}
+
+Génère le plan complet.`;
+
+  try {
+    const upstream = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMsg }],
+        response_format: { type: 'json_object' },
+        max_tokens: 2048,
+        temperature: 0.6,
+      }),
+    });
+
+    const data = await upstream.json();
+    if (!upstream.ok) return res.status(upstream.status).json({ error: data.error?.message ?? 'Erreur Groq.' });
+
+    const raw = data.choices?.[0]?.message?.content ?? '{}';
+    let plan;
+    try { plan = JSON.parse(raw); }
+    catch { return res.status(500).json({ error: 'Le modèle n\'a pas retourné un JSON valide.' }); }
+
+    // Validation minimale
+    if (!plan.tasks || !Array.isArray(plan.tasks)) plan.tasks = [];
+    if (!plan.milestones || !Array.isArray(plan.milestones)) plan.milestones = [];
+    if (!plan.summary) plan.summary = 'Plan généré par l\'IA.';
+
+    return res.json({ plan });
+  } catch (err) {
+    console.error('Plan generation error:', err);
+    return res.status(502).json({ error: 'Erreur lors de la génération du plan.' });
+  }
+});
+
 // ─── /api/messages — ancien endpoint Anthropic (backward compat) ─────────────
 app.post('/api/messages', auth, async (req, res) => {
   const ip = (req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? '').split(',')[0].trim();
