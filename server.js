@@ -16,8 +16,8 @@ const GROQ_MODELS = new Set([
 ]);
 const ANTHROPIC_MODELS = new Set([
   'claude-opus-4-7',
-  'claude-sonnet-4-5',
-  'claude-haiku-3-5',
+  'claude-sonnet-4-6',
+  'claude-haiku-4-5-20251001',
 ]);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -30,6 +30,9 @@ app.use((_, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
+  res.setHeader('Content-Security-Policy', "default-src 'none'");
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
   next();
 });
 
@@ -85,9 +88,17 @@ app.post('/api/chat', auth, async (req, res) => {
   // Clamp max_tokens to prevent cost abuse
   const max_tokens = Math.min(Math.max(1, Number(rawMaxTokens) || 1024), MAX_TOKENS_LIMIT);
 
-  // Validate messages is an array
+  // Validate messages is an array and sanitize each entry
   if (!Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages doit être un tableau.' });
+  }
+  // Strip any injected system messages and unknown fields; only allow role+content
+  const ALLOWED_ROLES = new Set(['user', 'assistant']);
+  const sanitizedMessages = messages
+    .filter(m => m && typeof m === 'object' && ALLOWED_ROLES.has(m.role))
+    .map(m => ({ role: m.role, content: m.content }));
+  if (sanitizedMessages.length === 0 && messages.length > 0) {
+    return res.status(400).json({ error: 'Aucun message valide (role user/assistant requis).' });
   }
 
   // ── Groq (LLaMA 3.3 70B — gratuit) ─────────────────────────────────────────
@@ -101,7 +112,7 @@ app.post('/api/chat', auth, async (req, res) => {
     try {
       const groqMessages = [];
       if (system) groqMessages.push({ role: 'system', content: String(system) });
-      groqMessages.push(...messages);
+      groqMessages.push(...sanitizedMessages);
 
       const upstream = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
@@ -151,7 +162,7 @@ app.post('/api/chat', auth, async (req, res) => {
           model,
           max_tokens,
           system,
-          messages,
+          messages: sanitizedMessages,
         }),
       });
 
@@ -255,6 +266,11 @@ app.post('/api/messages', auth, async (req, res) => {
   const model = (requestedModel && ANTHROPIC_MODELS.has(requestedModel))
     ? requestedModel
     : 'claude-opus-4-7';
+  // Strip injected system roles and unknown fields
+  const ALLOWED_ROLES_MSGS = new Set(['user', 'assistant']);
+  const safeMessages = messages
+    .filter(m => m && typeof m === 'object' && ALLOWED_ROLES_MSGS.has(m.role))
+    .map(m => ({ role: m.role, content: m.content }));
 
   try {
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
@@ -264,7 +280,7 @@ app.post('/api/messages', auth, async (req, res) => {
         'x-api-key':          ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({ model, system, messages, max_tokens }),
+      body: JSON.stringify({ model, system, messages: safeMessages, max_tokens }),
     });
     const data = await upstream.json();
     if (!upstream.ok) {
