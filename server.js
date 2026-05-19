@@ -333,6 +333,39 @@ Génère le plan complet et professionnel.`;
   }
 });
 
+// ─── /api/memory — Jarvis Memory Bridge ─────────────────────────────────────
+// POST  : reçoit le memory.json depuis le Mac (script memory_sync.py)
+// GET   : retourne le contexte pour REMI iOS
+let memoryStore = null; // { updatedAt, profile, remi_dev, trading, strategy, projects, recentSessions }
+
+const MAX_MEMORY_SIZE = 64 * 1024; // 64 KB max
+
+app.post('/api/memory', jsonSmall, auth, (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object') {
+    return res.status(400).json({ error: 'Body JSON invalide.' });
+  }
+  // Stocker uniquement les champs attendus (whitelist)
+  memoryStore = {
+    updatedAt:      typeof body.updatedAt === 'string'  ? body.updatedAt.slice(0, 32) : new Date().toISOString(),
+    profile:        typeof body.profile === 'string'    ? body.profile.slice(0, 8000) : '',
+    remi_dev:       typeof body.remi_dev === 'string'   ? body.remi_dev.slice(0, 6000) : '',
+    trading:        typeof body.trading === 'string'    ? body.trading.slice(0, 4000) : '',
+    strategy:       typeof body.strategy === 'string'   ? body.strategy.slice(0, 3000) : '',
+    projects:       typeof body.projects === 'string'   ? body.projects.slice(0, 4000) : '',
+    recentSessions: Array.isArray(body.recentSessions)  ? body.recentSessions.slice(0, 5) : [],
+  };
+  console.log(`Memory updated: ${memoryStore.updatedAt}`);
+  return res.json({ ok: true, updatedAt: memoryStore.updatedAt });
+});
+
+app.get('/api/memory', auth, (req, res) => {
+  if (!memoryStore) {
+    return res.status(404).json({ error: 'Mémoire non initialisée — sync en attente.' });
+  }
+  return res.json(memoryStore);
+});
+
 // ─── /api/messages — ancien endpoint Anthropic (backward compat) ─────────────
 app.post('/api/messages', jsonLarge, auth, async (req, res) => {
   const ip = getRealIP(req);
