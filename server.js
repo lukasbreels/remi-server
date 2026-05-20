@@ -42,7 +42,9 @@ app.use((_, res, next) => {
   res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
   res.setHeader('Content-Security-Policy', "default-src 'none'");
   res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
-  res.setHeader('Access-Control-Allow-Origin', 'null');
+  // No CORS header — this API is consumed exclusively by the native iOS app.
+  // Setting Access-Control-Allow-Origin: null would paradoxically allow
+  // cross-origin requests from file:// origins.
   next();
 });
 
@@ -77,7 +79,7 @@ function auth(req, res, next) {
   const padLen = Math.max(provided.length, expected.length, 32);
   const a = Buffer.from(provided.padEnd(padLen));
   const b = Buffer.from(expected.padEnd(padLen));
-  if (!APP_SECRET || !timingSafeEqual(a, b)) {
+  if (!APP_SECRET || APP_SECRET.length < 8 || !timingSafeEqual(a, b)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
@@ -477,4 +479,4 @@ app.get('/api/trades/status', auth, (req, res) => {
   res.json({ queued: tradeQueue.length, lastPush: lastPushAt });
 });
 
-app.listen(PORT, () => console.log(`REMI Proxy — Groq: ${GROQ_API_KEY ? '✓' : '✗'}  Anthropic: ${ANTHROPIC_API_KEY ? '✓' : '✗'}`));
+app.listen(PORT, () => console.log(`REMI Proxy listening on port ${PORT}`));
