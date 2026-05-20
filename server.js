@@ -420,4 +420,61 @@ app.post('/api/messages', jsonLarge, auth, async (req, res) => {
   }
 });
 
+// ─── /api/trades — MT5 sync queue ────────────────────────────────────────────
+// The MT5 watcher script POSTs new trades here; the REMI app GETs and clears them.
+//
+//  POST /api/trades/push   → { trades: [...TradeRecord] }  (from watcher script)
+//  GET  /api/trades/pull   → { trades: [...] }             (from REMI app, clears queue)
+//  GET  /api/trades/status → { queued: N, lastPush: ISO }  (healthcheck)
+//
+// Security: same x-app-secret header as all other endpoints.
+// In-memory queue — resets on server restart (Render redeploys ~once/day max).
+// For persistent queue, upgrade to a KV store.
+
+let tradeQueue  = [];    // pending trades not yet fetched by REMI
+let lastPushAt  = null;
+const MAX_QUEUE = 500;   // prevent memory abuse
+
+// Validate a trade object (basic sanity)
+function sanitizeTrade(t) {
+  if (!t || typeof t !== 'object') return null;
+  return {
+    id:          typeof t.id === 'string'          ? t.id.slice(0, 64)          : crypto.randomUUID(),
+    symbol:      typeof t.symbol === 'string'      ? t.symbol.slice(0, 20)      : 'UNKNOWN',
+    direction:   t.direction === 'sell'            ? 'sell'                      : 'buy',
+    openTime:    typeof t.openTime === 'string'    ? t.openTime.slice(0, 32)    : new Date().toISOString(),
+    closeTime:   typeof t.closeTime === 'string'   ? t.closeTime.slice(0, 32)   : null,
+    lots:        typeof t.lots === 'number'        ? Math.abs(t.lots)           : 0.01,
+    openPrice:   typeof t.openPrice === 'number'   ? t.openPrice                : 0,
+    closePrice:  typeof t.closePrice === 'number'  ? t.closePrice               : 0,
+    profit:      typeof t.profit === 'number'      ? t.profit                   : 0,
+    commission:  typeof t.commission === 'number'  ? t.commission               : 0,
+    swap:        typeof t.swap === 'number'        ? t.swap                     : 0,
+    isDemo:      t.isDemo === true,
+    closeType:   typeof t.closeType === 'string'   ? t.closeType.slice(0, 20)   : 'manual',
+    session:     typeof t.session === 'string'     ? t.session.slice(0, 20)     : 'london',
+    notes:       typeof t.notes === 'string'       ? t.notes.slice(0, 500)      : '',
+    setup:       typeof t.setup === 'string'       ? t.setup.slice(0, 200)      : '',
+  };
+}
+
+app.post('/api/trades/push', jsonSmall, auth, (req, res) => {
+  const raw = Array.isArray(req.body?.trades) ? req.body.trades : [];
+  if (raw.length === 0) return res.status(400).json({ error: 'trades[] vide ou manquant.' });
+  const sanitized = raw.map(sanitizeTrade).filter(Boolean).slice(0, 100); // max 100/push
+  tradeQueue = [...tradeQueue, ...sanitized].slice(-MAX_QUEUE);
+  lastPushAt = new Date().toISOString();
+  console.log(`[MT5] ${sanitized.length} trade(s) en queue (total: ${tradeQueue.length})`);
+  res.json({ received: sanitized.length, queued: tradeQueue.length });
+});
+
+app.get('/api/trades/pull', auth, (req, res) => {
+  const batch = tradeQueue.splice(0);   // atomic drain
+  res.json({ trades: batch, remaining: 0 });
+});
+
+app.get('/api/trades/status', auth, (req, res) => {
+  res.json({ queued: tradeQueue.length, lastPush: lastPushAt });
+});
+
 app.listen(PORT, () => console.log(`REMI Proxy — Groq: ${GROQ_API_KEY ? '✓' : '✗'}  Anthropic: ${ANTHROPIC_API_KEY ? '✓' : '✗'}`));
