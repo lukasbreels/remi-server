@@ -42,9 +42,23 @@ app.use((_, res, next) => {
   res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
   res.setHeader('Content-Security-Policy', "default-src 'none'");
   res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   // No CORS header — this API is consumed exclusively by the native iOS app.
   // Setting Access-Control-Allow-Origin: null would paradoxically allow
   // cross-origin requests from file:// origins.
+  next();
+});
+
+// ─── Content-Type validation — reject non-JSON POST bodies ───────────────────
+app.use((req, res, next) => {
+  if (req.method === 'POST' && req.path !== '/health') {
+    const ct = req.headers['content-type'] ?? '';
+    if (!ct.includes('application/json')) {
+      return res.status(415).json({ error: 'Content-Type application/json requis.' });
+    }
+  }
   next();
 });
 
@@ -58,12 +72,13 @@ function getRealIP(req) {
   if (forwarded) return forwarded.split(',')[0].trim();
   return req.socket.remoteAddress ?? 'unknown';
 }
-function rateLimit(ip, limit) {
+function rateLimit(ip, limit, globalKey = null) {
+  const key  = globalKey ?? ip;
   const now  = Date.now();
-  const slot = rateMap.get(ip) ?? { n: 0, reset: now + 3_600_000 };
+  const slot = rateMap.get(key) ?? { n: 0, reset: now + 3_600_000 };
   if (now > slot.reset) { slot.n = 0; slot.reset = now + 3_600_000; }
   slot.n++;
-  rateMap.set(ip, slot);
+  rateMap.set(key, slot);
   return slot.n <= limit;
 }
 setInterval(() => {
@@ -101,9 +116,10 @@ app.post('/api/chat', jsonLarge, auth, async (req, res) => {
   const ip = getRealIP(req);
   const { provider = 'groq', system, messages = [], max_tokens: rawMaxTokens = 1024 } = req.body;
 
-  // Per-provider rate limits
+  // Per-provider rate limits — Anthropic uses a shared cross-endpoint bucket
   const limit = provider === 'anthropic' ? MAX_ANTHROPIC_REQ : MAX_GROQ_REQ;
-  if (!rateLimit(ip, limit)) {
+  const key   = provider === 'anthropic' ? `${ip}:anthropic` : ip;
+  if (!rateLimit(key, limit, key)) {
     return res.status(429).json({ error: 'Trop de requêtes. Réessaie dans une heure.' });
   }
 
@@ -118,7 +134,12 @@ app.post('/api/chat', jsonLarge, auth, async (req, res) => {
   const ALLOWED_ROLES = new Set(['user', 'assistant']);
   const sanitizedMessages = messages
     .filter(m => m && typeof m === 'object' && ALLOWED_ROLES.has(m.role))
-    .map(m => ({ role: m.role, content: m.content }));
+    .map(m => ({
+      role: m.role,
+      content: typeof m.content === 'string'
+        ? m.content.slice(0, 50_000)
+        : m.content,  // preserve array content (vision/images)
+    }));
   if (sanitizedMessages.length === 0 && messages.length > 0) {
     return res.status(400).json({ error: 'Aucun message valide (role user/assistant requis).' });
   }
@@ -371,7 +392,7 @@ app.get('/api/memory', auth, (req, res) => {
 // ─── /api/messages — ancien endpoint Anthropic (backward compat) ─────────────
 app.post('/api/messages', jsonLarge, auth, async (req, res) => {
   const ip = getRealIP(req);
-  if (!rateLimit(ip, MAX_ANTHROPIC_REQ)) return res.status(429).json({ error: 'Trop de requêtes.' });
+  if (!rateLimit(`${ip}:anthropic`, MAX_ANTHROPIC_REQ, `${ip}:anthropic`)) return res.status(429).json({ error: 'Trop de requêtes.' });
   if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Service indisponible.' });
 
   const { system, messages, max_tokens: rawMaxTokens = 1024 } = req.body;
@@ -386,7 +407,12 @@ app.post('/api/messages', jsonLarge, auth, async (req, res) => {
   const ALLOWED_ROLES_MSGS = new Set(['user', 'assistant']);
   const safeMessages = messages
     .filter(m => m && typeof m === 'object' && ALLOWED_ROLES_MSGS.has(m.role))
-    .map(m => ({ role: m.role, content: m.content }));
+    .map(m => ({
+      role: m.role,
+      content: typeof m.content === 'string'
+        ? m.content.slice(0, 50_000)
+        : m.content,  // preserve array content (vision/images)
+    }));
 
   try {
     const legacyCtrl = new AbortController();
