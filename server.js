@@ -711,14 +711,16 @@ app.get('/api/news-briefing', auth, async (req, res) => {
     });
   }
 
-  // ── Cold start: no cache yet — must wait for first build ─────────────────
-  // (happens only on the very first request after a server restart)
+  // ── Cold start: no cache yet — wait for in-progress build (or kick one off) ─
+  // FIX: `_newsBuildPromise` is a chained .then().catch().finally() that resolves
+  // to `undefined`. Assigning `_newsCache = await _newsBuildPromise` would overwrite
+  // the cache set by the .then() side-effect with undefined → TypeError → 503 loop.
+  // Solution: just await (side-effect sets _newsCache), then read it directly.
   try {
-    if (!_newsBuildPromise) {
-      _newsBuildPromise = _buildNewsBriefing().finally(() => { _newsBuildPromise = null; });
-    }
-    _newsCache = await _newsBuildPromise;
-    console.log(`[news] ${_newsCache.bullets.length} bullets générés (cold start)`);
+    if (!_newsBuildPromise) _triggerNewsRefresh(); // uses .then(fresh=>{ _newsCache=fresh })
+    await _newsBuildPromise;                        // wait — side-effect already set _newsCache
+    if (!_newsCache) throw new Error('Build terminé mais cache vide');
+    console.log(`[news] ${_newsCache.bullets.length} bullets (cold start)`);
     res.json({ bullets: _newsCache.bullets, headlines: _newsCache.headlines, generatedAt: _newsCache.generatedAt });
   } catch (err) {
     console.error('[news]', err.message);
