@@ -517,7 +517,8 @@ app.get('/api/trades/status', auth, (req, res) => {
 
 let _newsCache        = null;   // { bullets: string[], headlines: string[], generatedAt: string, expiresAt: number }
 let _newsBuildPromise = null;   // in-flight build — prevents parallel Claude calls
-const NEWS_TTL = 6 * 60 * 60 * 1000;
+const NEWS_TTL    = 55 * 60 * 1000;  // 55 min — actualités fraîches, cohérent avec le refresh auto
+const NEWS_REFRESH = 55 * 60 * 1000; // intervalle du refresh automatique côté serveur
 
 const NEWS_FEEDS = [
   // Actualité mondiale
@@ -604,23 +605,51 @@ async function _buildNewsBriefing() {
   return { bullets, headlines: rawHeadlines, generatedAt: new Date().toISOString(), expiresAt: Date.now() + NEWS_TTL };
 }
 
+// ── Auto-refresh background task ─────────────────────────────────────────────
+// Fires on startup then every NEWS_REFRESH ms so the cache is always warm.
+// Never blocks an incoming request — fully fire-and-forget.
+function _triggerNewsRefresh() {
+  if (_newsBuildPromise) return; // already building
+  _newsBuildPromise = _buildNewsBriefing()
+    .then(fresh => {
+      _newsCache = fresh;
+      console.log(`[news] Cache auto-rafraîchi — ${fresh.bullets.length} bullets`);
+    })
+    .catch(e => console.error('[news] Auto-refresh échoué:', e.message))
+    .finally(() => { _newsBuildPromise = null; });
+}
+
+// Pre-warm immediately on startup (2s delay to let env vars / DB settle)
+setTimeout(_triggerNewsRefresh, 2_000);
+// Keep refreshing even while Render sleeps between requests
+setInterval(_triggerNewsRefresh, NEWS_REFRESH);
+
 app.get('/api/news-briefing', auth, async (req, res) => {
+  // ── Stale-while-revalidate ───────────────────────────────────────────────
+  // If ANY cache exists (even expired), return it instantly and refresh
+  // in the background. The client gets <100 ms response every time.
+  if (_newsCache) {
+    const isStale = Date.now() >= _newsCache.expiresAt;
+    if (isStale) _triggerNewsRefresh(); // silent background refresh
+    return res.json({
+      bullets:     _newsCache.bullets,
+      headlines:   _newsCache.headlines,
+      generatedAt: _newsCache.generatedAt,
+      stale:       isStale,
+    });
+  }
+
+  // ── Cold start: no cache yet — must wait for first build ─────────────────
+  // (happens only on the very first request after a server restart)
   try {
-    // Serve from cache if still fresh
-    if (_newsCache && Date.now() < _newsCache.expiresAt) {
-      return res.json({ bullets: _newsCache.bullets, headlines: _newsCache.headlines, generatedAt: _newsCache.generatedAt });
-    }
-    // Deduplicate: if a build is already in-flight, await the same Promise
     if (!_newsBuildPromise) {
       _newsBuildPromise = _buildNewsBriefing().finally(() => { _newsBuildPromise = null; });
     }
     _newsCache = await _newsBuildPromise;
-    console.log(`[news] ${_newsCache.bullets.length} bullets générés`);
+    console.log(`[news] ${_newsCache.bullets.length} bullets générés (cold start)`);
     res.json({ bullets: _newsCache.bullets, headlines: _newsCache.headlines, generatedAt: _newsCache.generatedAt });
   } catch (err) {
     console.error('[news]', err.message);
-    // Stale fallback: return expired cache rather than error
-    if (_newsCache) return res.json({ bullets: _newsCache.bullets, headlines: _newsCache.headlines, generatedAt: _newsCache.generatedAt, stale: true });
     res.status(503).json({ error: 'News briefing indisponible' });
   }
 });
