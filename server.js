@@ -3,6 +3,8 @@ import { timingSafeEqual } from 'crypto';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+// Trust Render.com load balancer so X-Forwarded-For reflects the real client IP
+app.set('trust proxy', 1);
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const GROQ_API_KEY      = process.env.GROQ_API_KEY;
@@ -114,7 +116,9 @@ app.get('/health', (_, res) => res.json({ ok: true }));
 // body: { provider?, system, messages: [{role,content}], max_tokens? }
 app.post('/api/chat', jsonLarge, auth, async (req, res) => {
   const ip = getRealIP(req);
-  const { provider = 'groq', system, messages = [], max_tokens: rawMaxTokens = 1024 } = req.body;
+  const { provider = 'groq', messages = [], max_tokens: rawMaxTokens = 1024 } = req.body;
+  // Cap system prompt size — prevents token abuse (limits to ~5 000 words)
+  const system = typeof req.body.system === 'string' ? req.body.system.slice(0, 20_000) : undefined;
 
   // Per-provider rate limits — Anthropic uses a shared cross-endpoint bucket
   const limit = provider === 'anthropic' ? MAX_ANTHROPIC_REQ : MAX_GROQ_REQ;
@@ -395,7 +399,9 @@ app.post('/api/messages', jsonLarge, auth, async (req, res) => {
   if (!rateLimit(`${ip}:anthropic`, MAX_ANTHROPIC_REQ, `${ip}:anthropic`)) return res.status(429).json({ error: 'Trop de requêtes.' });
   if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Service indisponible.' });
 
-  const { system, messages, max_tokens: rawMaxTokens = 1024 } = req.body;
+  const { messages, max_tokens: rawMaxTokens = 1024 } = req.body;
+  // Cap system prompt size — prevents token abuse
+  const system = typeof req.body.system === 'string' ? req.body.system.slice(0, 20_000) : undefined;
   if (!Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages doit être un tableau.' });
   }
@@ -503,6 +509,120 @@ app.get('/api/trades/pull', auth, (req, res) => {
 
 app.get('/api/trades/status', auth, (req, res) => {
   res.json({ queued: tradeQueue.length, lastPush: lastPushAt });
+});
+
+// ─── /api/news-briefing — débrief actu financière + mondiale ─────────────────
+// Agrège 6 flux RSS internationaux, résume en 5 bullets français via Claude Haiku.
+// Cache en mémoire 6h pour ne pas refetcher à chaque ouverture d'app.
+
+let _newsCache        = null;   // { bullets: string[], headlines: string[], generatedAt: string, expiresAt: number }
+let _newsBuildPromise = null;   // in-flight build — prevents parallel Claude calls
+const NEWS_TTL = 6 * 60 * 60 * 1000;
+
+const NEWS_FEEDS = [
+  // Actualité mondiale
+  { url: 'https://feeds.bbci.co.uk/news/world/rss.xml',               label: 'BBC World'    },
+  { url: 'https://www.theguardian.com/world/rss',                      label: 'The Guardian' },
+  { url: 'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',     label: 'NYT World'    },
+  // Finance & marchés
+  { url: 'https://feeds.bbci.co.uk/news/business/rss.xml',            label: 'BBC Business' },
+  { url: 'https://feeds.a.dj.com/rss/RSSWorldNews.xml',               label: 'WSJ World'    },
+  // Perspective européenne / francophone
+  { url: 'https://www.lemonde.fr/rss/une.xml',                         label: 'Le Monde'     },
+];
+
+function _decodeRSS(s) {
+  return s.replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"')
+    .replace(/&#39;/g,"'").replace(/&apos;/g,"'").replace(/&#\d+;/g,'').trim();
+}
+
+function _parseItems(xml, n = 5) {
+  const out = [];
+  const itemRe = /<item[\s>]([\s\S]*?)<\/item>/g;
+  const titleRe = /<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/;
+  let m;
+  while ((m = itemRe.exec(xml)) !== null && out.length < n) {
+    const tm = titleRe.exec(m[1]);
+    if (tm) out.push(_decodeRSS(tm[1]));
+  }
+  return out;
+}
+
+async function _buildNewsBriefing() {
+  // Guard: ANTHROPIC_API_KEY required
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configuré');
+
+  // 1. Fetch headlines concurrently
+  const headlines = [];
+  await Promise.allSettled(NEWS_FEEDS.map(async ({ url, label }) => {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!r.ok) return;
+      const items = _parseItems(await r.text(), 4);
+      items.forEach(t => headlines.push(`[${label}] ${t}`));
+    } catch { /* feed unreachable — skip */ }
+  }));
+
+  if (headlines.length === 0) throw new Error('Aucun flux RSS accessible');
+
+  // Shuffle headlines so no single source dominates when we trim
+  headlines.sort(() => Math.random() - 0.5);
+  const topHeadlines = headlines.slice(0, 20); // cap at 20 titles sent to Claude
+
+  // 2. Summarise with Claude Haiku (15 s timeout to prevent dangling requests)
+  const today = new Date().toLocaleDateString('fr-BE', { weekday:'long', day:'numeric', month:'long' });
+  const userMsg = `Date : ${today}\n\nTitres du jour :\n${topHeadlines.map((h,i)=>`${i+1}. ${h}`).join('\n')}\n\nGénère exactement 5 bullets (•) en français. Format : "• [CATÉGORIE] : 1 phrase factuelle et concise." Catégories : MARCHÉS, ÉCONOMIE, MONDE, ENTREPRISES, GÉO. Priorité aux actualités mondiales majeures et aux marchés financiers. Pas d'intro ni de conclusion, juste les 5 bullets.`;
+
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    signal: AbortSignal.timeout(15_000),
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 600,
+      messages: [{ role: 'user', content: userMsg }],
+    }),
+  });
+  if (!r.ok) throw new Error(`Anthropic ${r.status}`);
+  const raw = ((await r.json()).content?.[0]?.text ?? '');
+
+  const bullets = raw.split('\n')
+    .map(l => l.trim())
+    .filter(l => /^[•\-\*]/.test(l))
+    .map(l => l.replace(/^[•\-\*]\s*/, '').trim())
+    .filter(l => l.length > 10)
+    .slice(0, 5);
+
+  // Also expose raw headlines for morning briefing integration (top 5, stripped of source label)
+  const rawHeadlines = topHeadlines.slice(0, 5).map(h => h.replace(/^\[[^\]]+\]\s*/, ''));
+
+  return { bullets, headlines: rawHeadlines, generatedAt: new Date().toISOString(), expiresAt: Date.now() + NEWS_TTL };
+}
+
+app.get('/api/news-briefing', auth, async (req, res) => {
+  try {
+    // Serve from cache if still fresh
+    if (_newsCache && Date.now() < _newsCache.expiresAt) {
+      return res.json({ bullets: _newsCache.bullets, headlines: _newsCache.headlines, generatedAt: _newsCache.generatedAt });
+    }
+    // Deduplicate: if a build is already in-flight, await the same Promise
+    if (!_newsBuildPromise) {
+      _newsBuildPromise = _buildNewsBriefing().finally(() => { _newsBuildPromise = null; });
+    }
+    _newsCache = await _newsBuildPromise;
+    console.log(`[news] ${_newsCache.bullets.length} bullets générés`);
+    res.json({ bullets: _newsCache.bullets, headlines: _newsCache.headlines, generatedAt: _newsCache.generatedAt });
+  } catch (err) {
+    console.error('[news]', err.message);
+    // Stale fallback: return expired cache rather than error
+    if (_newsCache) return res.json({ bullets: _newsCache.bullets, headlines: _newsCache.headlines, generatedAt: _newsCache.generatedAt, stale: true });
+    res.status(503).json({ error: 'News briefing indisponible' });
+  }
 });
 
 app.listen(PORT, () => console.log(`REMI Proxy listening on port ${PORT}`));
