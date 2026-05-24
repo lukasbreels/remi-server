@@ -623,10 +623,12 @@ function _parseItems(xml, n = 5) {
 }
 
 async function _buildNewsBriefing() {
-  // Guard: ANTHROPIC_API_KEY required
-  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY non configuré');
+  // Uses Groq LLaMA (fast, ~2-3 s) — more reliable than Anthropic for batch summaries.
+  // Falls back to raw headlines if the LLM call fails, so the cache is ALWAYS populated
+  // as long as at least one RSS feed is reachable.
+  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY non configuré');
 
-  // 1. Fetch headlines concurrently
+  // 1. Fetch headlines concurrently (8 s timeout per feed)
   const headlines = [];
   await Promise.allSettled(NEWS_FEEDS.map(async ({ url, label }) => {
     try {
@@ -639,40 +641,45 @@ async function _buildNewsBriefing() {
 
   if (headlines.length === 0) throw new Error('Aucun flux RSS accessible');
 
-  // Shuffle headlines so no single source dominates when we trim
+  // Shuffle so no single source dominates
   headlines.sort(() => Math.random() - 0.5);
-  const topHeadlines = headlines.slice(0, 20); // cap at 20 titles sent to Claude
-
-  // 2. Summarise with Claude Haiku (15 s timeout to prevent dangling requests)
-  const today = new Date().toLocaleDateString('fr-BE', { weekday:'long', day:'numeric', month:'long' });
-  const userMsg = `Date : ${today}\n\nTitres du jour :\n${topHeadlines.map((h,i)=>`${i+1}. ${h}`).join('\n')}\n\nGénère exactement 5 bullets (•) en français. Format : "• [CATÉGORIE] : 1 phrase factuelle et concise." Catégories : MARCHÉS, ÉCONOMIE, MONDE, ENTREPRISES, GÉO. Priorité aux actualités mondiales majeures et aux marchés financiers. Pas d'intro ni de conclusion, juste les 5 bullets.`;
-
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    signal: AbortSignal.timeout(15_000),
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 600,
-      messages: [{ role: 'user', content: userMsg }],
-    }),
-  });
-  if (!r.ok) throw new Error(`Anthropic ${r.status}`);
-  const raw = ((await r.json()).content?.[0]?.text ?? '');
-
-  const bullets = raw.split('\n')
-    .map(l => l.trim())
-    .filter(l => /^[•\-\*]/.test(l))
-    .map(l => l.replace(/^[•\-\*]\s*/, '').trim())
-    .filter(l => l.length > 10)
-    .slice(0, 5);
-
-  // Also expose raw headlines for morning briefing integration (top 5, stripped of source label)
+  const topHeadlines = headlines.slice(0, 20);
   const rawHeadlines = topHeadlines.slice(0, 5).map(h => h.replace(/^\[[^\]]+\]\s*/, ''));
+
+  // 2. Summarise with Groq LLaMA (20 s timeout)
+  let bullets = [];
+  try {
+    const today = new Date().toLocaleDateString('fr-BE', { weekday:'long', day:'numeric', month:'long' });
+    const userMsg = `Date : ${today}\n\nTitres du jour :\n${topHeadlines.map((h,i)=>`${i+1}. ${h}`).join('\n')}\n\nGénère exactement 5 bullets (•) en français. Format : "• [CATÉGORIE] : 1 phrase factuelle et concise." Catégories : MARCHÉS, ÉCONOMIE, MONDE, ENTREPRISES, GÉO. Priorité aux actualités mondiales majeures et aux marchés financiers. Pas d'intro ni de conclusion, juste les 5 bullets.`;
+
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      signal: AbortSignal.timeout(20_000),
+      headers: { 'content-type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 600,
+        messages: [{ role: 'user', content: userMsg }],
+      }),
+    });
+    if (r.ok) {
+      const raw = ((await r.json()).choices?.[0]?.message?.content ?? '');
+      bullets = raw.split('\n')
+        .map(l => l.trim())
+        .filter(l => /^[•\-\*]/.test(l))
+        .map(l => l.replace(/^[•\-\*]\s*/, '').trim())
+        .filter(l => l.length > 10)
+        .slice(0, 5);
+    }
+  } catch (e) {
+    console.warn('[news] Groq call failed, using raw headlines as fallback:', e.message);
+  }
+
+  // Fallback: if LLM returned < 3 bullets, use raw headlines directly
+  if (bullets.length < 3) {
+    bullets = topHeadlines.slice(0, 5).map(h => h.replace(/^\[[^\]]+\]\s*/, ''));
+    console.log('[news] Fallback: returning raw headlines');
+  }
 
   return { bullets, headlines: rawHeadlines, generatedAt: new Date().toISOString(), expiresAt: Date.now() + NEWS_TTL };
 }
