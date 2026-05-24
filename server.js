@@ -1,5 +1,6 @@
 import express from 'express';
 import { timingSafeEqual } from 'crypto';
+import { XMLParser } from 'fast-xml-parser';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -538,16 +539,32 @@ function _decodeRSS(s) {
     .replace(/&#39;/g,"'").replace(/&apos;/g,"'").replace(/&#\d+;/g,'').trim();
 }
 
+// Shared parser: CDATA stored under __cdata; item/event always returned as arrays
+const _xmlParser = new XMLParser({
+  ignoreAttributes: true,
+  cdataPropName:    '__cdata',
+  isArray:          name => name === 'item' || name === 'event',
+  trimValues:       true,
+});
+
+// Extracts string value from plain-text or CDATA-wrapped XML node
+function _xmlStr(node) {
+  if (!node && node !== 0) return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  return String(node.__cdata ?? '');
+}
+
 function _parseItems(xml, n = 5) {
-  const out = [];
-  const itemRe = /<item[\s>]([\s\S]*?)<\/item>/g;
-  const titleRe = /<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/;
-  let m;
-  while ((m = itemRe.exec(xml)) !== null && out.length < n) {
-    const tm = titleRe.exec(m[1]);
-    if (tm) out.push(_decodeRSS(tm[1]));
+  try {
+    const doc   = _xmlParser.parse(xml);
+    const items = doc?.rss?.channel?.item ?? doc?.feed?.entry ?? [];
+    return items
+      .slice(0, n)
+      .map(item => _decodeRSS(_xmlStr(item.title)))
+      .filter(Boolean);
+  } catch {
+    return [];
   }
-  return out;
 }
 
 async function _buildNewsBriefing() {
@@ -667,38 +684,31 @@ const FF_URLS = [
   'https://nfs.faireconomy.media/ff_calendar_nextweek.xml',
 ];
 
-function _decodeFF(s) {
-  return s
-    .replace(/<!\[CDATA\[/g,'').replace(/\]\]>/g,'')
-    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
-    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/\s+/g,' ').trim();
-}
-
 function _parseMacroXML(xml) {
-  const events = [];
-  const eventRe = /<event>([\s\S]*?)<\/event>/g;
-  const field = name => new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`);
-  let m;
-  while ((m = eventRe.exec(xml)) !== null) {
-    const body = m[1];
-    const get  = name => { const r = field(name).exec(body); return r ? _decodeFF(r[1]) : ''; };
-    const impact = get('impact');
-    if (impact !== 'High' && impact !== 'Medium') continue;
-    // Parse date MM-DD-YYYY → ISO
-    const rawDate = get('date');   // e.g. "05-26-2026"
-    const [mm, dd, yyyy] = rawDate.split('-');
-    const isoDate = `${yyyy}-${mm}-${dd}`;
-    events.push({
-      title:    get('title'),
-      country:  get('country'),
-      date:     isoDate,
-      time:     get('time'),
-      impact,
-      forecast: get('forecast'),
-      previous: get('previous'),
-    });
+  try {
+    const doc    = _xmlParser.parse(xml);
+    const events = doc?.weeklyevents?.event ?? [];
+    const out    = [];
+    for (const e of events) {
+      const impact = _xmlStr(e.impact);
+      if (impact !== 'High' && impact !== 'Medium') continue;
+      // Parse date MM-DD-YYYY → ISO
+      const rawDate = _xmlStr(e.date);  // e.g. "05-26-2026"
+      const [mm, dd, yyyy] = rawDate.split('-');
+      out.push({
+        title:    _xmlStr(e.title),
+        country:  _xmlStr(e.country),
+        date:     `${yyyy}-${mm}-${dd}`,
+        time:     _xmlStr(e.time),
+        impact,
+        forecast: _xmlStr(e.forecast),
+        previous: _xmlStr(e.previous),
+      });
+    }
+    return out;
+  } catch {
+    return [];
   }
-  return events;
 }
 
 async function _buildMacroCalendar() {
