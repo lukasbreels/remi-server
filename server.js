@@ -512,6 +512,61 @@ app.get('/api/trades/status', auth, (req, res) => {
   res.json({ queued: tradeQueue.length, lastPush: lastPushAt });
 });
 
+// ─── /api/workouts — AI write-queue pour séances sport ───────────────────────
+// N'importe quelle IA (ou script) peut pousser des sessions; REMI les importe.
+//
+//  POST /api/workouts/push   → { workouts: [...WorkoutEntry] }
+//  GET  /api/workouts/pull   → { workouts: [...] }   (vide la queue)
+//  GET  /api/workouts/status → { queued: N, lastPush: ISO }
+//
+// WorkoutEntry (tous optionnels sauf type+date) :
+//   id?, type (ex "Push"), date (ISO), durationMin, notes, isPlanned?,
+//   intensity?, feeling?, kcalBurned?, distanceKm?, volumeKg?
+
+let workoutQueue  = [];
+let workoutLastPush = null;
+const MAX_WORKOUT_QUEUE = 500;
+
+function sanitizeWorkout(w) {
+  if (!w || typeof w !== 'object') return null;
+  const id = typeof w.id === 'string' ? w.id.slice(0, 64) : crypto.randomUUID();
+  const date = typeof w.date === 'string' ? w.date.slice(0, 32) : new Date().toISOString();
+  const type = typeof w.type === 'string' ? w.type.slice(0, 50) : 'Entraînement';
+  return {
+    id,
+    date,
+    type,
+    durationMin:  typeof w.durationMin  === 'number' ? Math.max(0, Math.min(w.durationMin, 1440))  : 0,
+    notes:        typeof w.notes        === 'string' ? w.notes.slice(0, 500)    : '',
+    volumeKg:     typeof w.volumeKg     === 'number' ? w.volumeKg               : 0,
+    intensity:    typeof w.intensity    === 'number' ? Math.min(Math.max(w.intensity, 1), 10) : null,
+    feeling:      typeof w.feeling      === 'string' ? w.feeling.slice(0, 4)    : null,
+    kcalBurned:   typeof w.kcalBurned   === 'number' ? Math.abs(w.kcalBurned)   : null,
+    distanceKm:   typeof w.distanceKm   === 'number' ? w.distanceKm             : null,
+    isPlanned:    w.isPlanned === true,
+    sourceID:     'ai-push',  // marque l'origine IA
+  };
+}
+
+app.post('/api/workouts/push', jsonSmall, auth, (req, res) => {
+  const raw = Array.isArray(req.body?.workouts) ? req.body.workouts : [];
+  if (raw.length === 0) return res.status(400).json({ error: 'workouts[] vide ou manquant.' });
+  const sanitized = raw.map(sanitizeWorkout).filter(Boolean).slice(0, 50);
+  workoutQueue = [...workoutQueue, ...sanitized].slice(-MAX_WORKOUT_QUEUE);
+  workoutLastPush = new Date().toISOString();
+  console.log(`[workouts] ${sanitized.length} session(s) en queue (total: ${workoutQueue.length})`);
+  res.json({ received: sanitized.length, queued: workoutQueue.length });
+});
+
+app.get('/api/workouts/pull', auth, (req, res) => {
+  const batch = workoutQueue.splice(0);
+  res.json({ workouts: batch, remaining: 0 });
+});
+
+app.get('/api/workouts/status', auth, (req, res) => {
+  res.json({ queued: workoutQueue.length, lastPush: workoutLastPush });
+});
+
 // ─── /api/news-briefing — débrief actu financière + mondiale ─────────────────
 // Agrège 6 flux RSS internationaux, résume en 5 bullets français via Claude Haiku.
 // Cache en mémoire 6h pour ne pas refetcher à chaque ouverture d'app.
