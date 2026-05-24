@@ -654,4 +654,99 @@ app.get('/api/news-briefing', auth, async (req, res) => {
   }
 });
 
+// ─── /api/macro-calendar — calendrier économique Forex Factory ───────────────
+// Fetches FF XML feeds (this week + next week), filters High/Medium events,
+// returns sorted array. Cache 30 min.
+
+let _macroCache        = null;  // { events: [...], fetchedAt: string, expiresAt: number }
+let _macroBuildPromise = null;
+const MACRO_TTL = 30 * 60 * 1000;  // 30 min
+
+const FF_URLS = [
+  'https://nfs.faireconomy.media/ff_calendar_thisweek.xml',
+  'https://nfs.faireconomy.media/ff_calendar_nextweek.xml',
+];
+
+function _decodeFF(s) {
+  return s
+    .replace(/<!\[CDATA\[/g,'').replace(/\]\]>/g,'')
+    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/\s+/g,' ').trim();
+}
+
+function _parseMacroXML(xml) {
+  const events = [];
+  const eventRe = /<event>([\s\S]*?)<\/event>/g;
+  const field = name => new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`);
+  let m;
+  while ((m = eventRe.exec(xml)) !== null) {
+    const body = m[1];
+    const get  = name => { const r = field(name).exec(body); return r ? _decodeFF(r[1]) : ''; };
+    const impact = get('impact');
+    if (impact !== 'High' && impact !== 'Medium') continue;
+    // Parse date MM-DD-YYYY → ISO
+    const rawDate = get('date');   // e.g. "05-26-2026"
+    const [mm, dd, yyyy] = rawDate.split('-');
+    const isoDate = `${yyyy}-${mm}-${dd}`;
+    events.push({
+      title:    get('title'),
+      country:  get('country'),
+      date:     isoDate,
+      time:     get('time'),
+      impact,
+      forecast: get('forecast'),
+      previous: get('previous'),
+    });
+  }
+  return events;
+}
+
+async function _buildMacroCalendar() {
+  const allEvents = [];
+  await Promise.allSettled(FF_URLS.map(async url => {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (!r.ok) return;
+      const items = _parseMacroXML(await r.text());
+      allEvents.push(...items);
+    } catch { /* feed unreachable */ }
+  }));
+  // Sort chronologically (date ASC, then time)
+  allEvents.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+  return { events: allEvents, fetchedAt: new Date().toISOString(), expiresAt: Date.now() + MACRO_TTL };
+}
+
+function _triggerMacroRefresh() {
+  if (_macroBuildPromise) return;
+  _macroBuildPromise = _buildMacroCalendar()
+    .then(fresh => { _macroCache = fresh; console.log(`[macro] ${fresh.events.length} événements mis en cache`); })
+    .catch(e => console.error('[macro] Refresh échoué:', e.message))
+    .finally(() => { _macroBuildPromise = null; });
+}
+
+// Pre-warm on startup
+setTimeout(_triggerMacroRefresh, 3_000);
+// Refresh every 30 min
+setInterval(_triggerMacroRefresh, MACRO_TTL);
+
+app.get('/api/macro-calendar', auth, async (req, res) => {
+  // Stale-while-revalidate
+  if (_macroCache) {
+    const isStale = Date.now() >= _macroCache.expiresAt;
+    if (isStale) _triggerMacroRefresh();
+    return res.json({ events: _macroCache.events, fetchedAt: _macroCache.fetchedAt, stale: isStale });
+  }
+  // Cold start
+  try {
+    if (!_macroBuildPromise) {
+      _macroBuildPromise = _buildMacroCalendar().finally(() => { _macroBuildPromise = null; });
+    }
+    _macroCache = await _macroBuildPromise;
+    return res.json({ events: _macroCache.events, fetchedAt: _macroCache.fetchedAt });
+  } catch (err) {
+    console.error('[macro]', err.message);
+    return res.status(503).json({ error: 'Calendrier indisponible' });
+  }
+});
+
 app.listen(PORT, () => console.log(`REMI Proxy listening on port ${PORT}`));
